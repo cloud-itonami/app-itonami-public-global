@@ -1,0 +1,309 @@
+#!/usr/bin/env kbb
+;; Weekly manual citation-status check (AWAI-3824 decision (b)).
+;;
+;; Manual gate, never run from Tatara CI. An Orca automation (Ontology
+;; Collector) wakes a Muse worker once a week to run this and commit the
+;; dated receipt under receipts/ in a small one-commit PR.
+;;
+;; For every :catalog/entries row in facts/catalog.edn:
+;;   * HEAD :cite/url, retried once with Range GET (`bytes=0-0`) when HEAD
+;;     answers 4xx/5xx or fails at the transport level (timeout, refused,
+;;     reset). A HEAD 4xx alone is not the verdict: some healthy endpoints
+;;     refuse HEAD (measured 2026-11-21: HEAD 404 / GET 200 on the UN SDG
+;;     Goals API) while others refuse both (HEAD 403 / Range GET 403 on
+;;     data.worldbank.org). The retried method is recorded per entry.
+;;   * at least 1000 ms between two requests to the same host
+;;   * generic User-Agent (no personal name, no mail address)
+;;   * record per-URL status class + summary counts + date only.
+;;     Response bodies, substrings and archives are never stored.
+;;
+;; Exit codes:
+;;   0 — answered, every citation checked, all 2xx
+;;   1 — answered red: at least one citation non-2xx, or --verify failed
+;;   2 — could not answer (parse failure, zero checks, floor miss)
+;;
+;; "Nothing was checked" and "nothing was wrong" must not share an exit code.
+;;
+;; Usage:
+;;   kbb --backend sci tools/check_citation_status.cljk [--out receipts/2026-11-21.edn]
+;;   kbb --backend sci tools/check_citation_status.cljk --verify receipts/2026-11-21.edn
+
+(ns check-citation-status
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            ["fs" :as fs]
+            ["https" :as https]
+            ["http" :as http]
+            ["url" :as url]
+            ["path" :as path]))
+
+(def argv (vec (drop 3 (js->clj js/process.argv))))
+(defn flag? [f] (boolean (some #{f} argv)))
+(defn flag-val [f default]
+  (let [i (.indexOf argv f)]
+    (if (neg? i) default (get argv (inc i) default))))
+
+(def quiet? (flag? "--quiet"))
+(def verify-path (flag-val "--verify" nil))
+(def gap-ms (js/parseInt (flag-val "--gap-ms" "1100") 10))
+;; Strip flag *values* as well as flags so `--out X` cannot become the catalog path.
+(def catalog-path
+  (let [skip-next? (atom false)
+        positional
+        (reduce (fn [acc a]
+                  (cond
+                    @skip-next? (do (reset! skip-next? false) acc)
+                    (#{"--out" "--verify" "--gap-ms"} a) (do (reset! skip-next? true) acc)
+                    (str/starts-with? a "--") acc
+                    :else (conj acc a)))
+                []
+                argv)]
+    (or (first positional) "facts/catalog.edn")))
+
+;; Generic User-Agent: no personal name, no mail address (AWAI-3824).
+(def user-agent "Mozilla/5.0 (compatible; citation-status-check/1.0)")
+
+(defn say [& xs] (when-not quiet? (println (str/join " " xs))))
+
+(defn sleep [ms]
+  (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+;; Last request time per host, so the same host is never hit more often than
+;; once per gap-ms even when the catalogue lists many URLs on one host.
+(def last-hit #js {})
+
+(defn pace-for [hostname]
+  (let [now (.now js/Date)
+        prev (or (aget last-hit hostname) 0)
+        wait (- gap-ms (- now prev))]
+    (if (pos? wait)
+      (-> (sleep wait)
+          (.then (fn [_] (aset last-hit hostname (.now js/Date)))))
+      (do (aset last-hit hostname now)
+          (js/Promise.resolve nil)))))
+
+(defn request-once [u method extra-headers]
+  ;; Resolves {:status N :location LOC-or-nil}. The body is drained and
+  ;; discarded: status only, never stored.
+  (js/Promise.
+   (fn [resolve reject]
+     (try
+       (let [parsed (url/parse u)
+             lib (if (= (.-protocol parsed) "http:") http https)
+             req (.request
+                  lib
+                  #js {:protocol (.-protocol parsed)
+                       :hostname (.-hostname parsed)
+                       :port (.-port parsed)
+                       :path (.-path parsed)
+                       :method method
+                       :headers (clj->js (merge {"User-Agent" user-agent
+                                                 "Accept" "*/*"}
+                                                extra-headers))
+                       :timeout 30000}
+                  (fn [res]
+                    (let [loc (and (.-headers res)
+                                   (aget (.-headers res) "location"))]
+                      (.resume res)
+                      (.on res "end"
+                           (fn [] (resolve {:status (.-statusCode res)
+                                            :location loc})))
+                      (.on res "error" reject))))]
+         (.on req "error" reject)
+         (.on req "timeout" (fn [] (.destroy req) (reject (js/Error. "timeout"))))
+         (.end req))
+       (catch :default e (reject e))))))
+
+(defn fetch-status
+  "HEAD u; when HEAD answers 4xx/5xx or fails at the transport level,
+  one Range GET retry. Follows redirects up to 8 hops. Resolves
+  {:status N :method M} or rejects with the cause."
+  ([u] (fetch-status u "HEAD" nil 0))
+  ([u method extra-headers hops]
+   (-> (pace-for (.-hostname (url/parse u)))
+       (.then (fn [_] (request-once u method extra-headers)))
+       (.then
+        (fn [{:keys [status location]}]
+          (cond
+            ;; Redirect: follow, keeping the method and headers.
+            (and location (>= status 300) (<= status 399) (< hops 8))
+            (fetch-status (url/resolve u location) method extra-headers (inc hops))
+
+            ;; HEAD answered 4xx/5xx: one Range GET retry before calling it red.
+            (and (= method "HEAD") (>= status 400) (<= status 599))
+            (fetch-status u "GET" {"Range" "bytes=0-0"} hops)
+
+            :else
+            (js/Promise.resolve {:status status :method method}))))
+       (.catch
+        (fn [err]
+          (if (= method "HEAD")
+            ;; Transport-level HEAD failure: one Range GET retry.
+            (fetch-status u "GET" {"Range" "bytes=0-0"} hops)
+            (js/Promise.reject err)))))))
+
+(defn classify [status]
+  (cond
+    (and (>= status 200) (<= status 299)) :2xx
+    (and (>= status 300) (<= status 399)) :3xx
+    (and (>= status 400) (<= status 499)) :4xx
+    (and (>= status 500) (<= status 599)) :5xx
+    :else :error))
+
+(defn check-entry! [e]
+  (-> (fetch-status (:cite/url e))
+      (.then
+       (fn [{:keys [status method]}]
+         (let [class (classify status)]
+           (if (= class :2xx)
+             {:ok? true :id (:cite/id e) :url (:cite/url e)
+              :method method :status status :class class}
+             {:ok? false :id (:cite/id e) :url (:cite/url e)
+              :method method :status status :class class
+              :why (str "HTTP " status)}))))
+      (.catch
+       (fn [err]
+         {:ok? false :id (:cite/id e) :url (:cite/url e)
+          :method "HEAD,GET+Range" :status nil :class :error
+          :why (str "fetch-error " (.-message err))}))))
+
+(defn utc-date []
+  (let [d (js/Date.)]
+    (str (.getUTCFullYear d) "-"
+         (-> (+ 1 (.getUTCMonth d)) str (->> (str "0")) (#(subs % (- (count %) 2))))
+         "-"
+         (-> (.getUTCDate d) str (->> (str "0")) (#(subs % (- (count %) 2)))))))
+
+(defn tool-revision []
+  (try
+    (let [cp (js/require "child_process")]
+      (str/trim (.toString (.execSync cp "git rev-parse --short HEAD") "utf8")))
+    (catch :default _ "unknown")))
+
+(defn default-out [] (str "receipts/" (utc-date) ".edn"))
+
+(defn finish! [code]
+  (set! (.-exitCode js/process) code)
+  ;; Give pending console I/O a tick, then exit hard so nbb cannot report 0
+  ;; after an async failure (same race the live gate documents).
+  (js/setTimeout (fn [] (js/process.exit code)) 50))
+
+(defn write-receipt! [out-path receipt]
+  (let [dir (.dirname path out-path)]
+    (when-not (.existsSync fs dir)
+      (.mkdirSync fs dir #js {:recursive true})))
+  (.writeFileSync fs out-path (pr-str receipt) "utf8"))
+
+(defn run-check! []
+  (when-not (.existsSync fs catalog-path)
+    (println "MISSING catalog" catalog-path)
+    (finish! 2)
+    nil)
+  (let [raw (try (edn/read-string (.readFileSync fs catalog-path "utf8"))
+                 (catch :default e
+                   (println "PARSE-FAIL" (.-message e))
+                   (finish! 2)
+                   nil))
+        entries (when raw (:catalog/entries raw))
+        declared-min (when raw (:catalog/min-citations raw))]
+    (when-not (seq entries)
+      (println "EMPTY catalog entries")
+      (finish! 2))
+    (when (and (seq entries) (not (integer? declared-min)))
+      (println "NO FLOOR: :catalog/min-citations must be declared")
+      (finish! 2))
+    (when (seq entries)
+      (let [out-path (flag-val "--out" (default-out))
+            rev (tool-revision)
+            day (utc-date)]
+        (-> (reduce
+             (fn [p e]
+               (-> p
+                   (.then (fn [acc]
+                            (-> (check-entry! e)
+                                (.then (fn [r]
+                                         (say (if (:ok? r) "OK" "FAIL")
+                                              (:id r)
+                                              (or (:why r) (:status r))
+                                              (str "(" (:method r) ")"))
+                                         (conj acc r))))))))
+             (js/Promise.resolve [])
+             entries)
+            (.then
+             (fn [results]
+               (let [n (count results)
+                     bad (filterv (complement :ok?) results)
+                     counts (reduce (fn [m r] (update m (:class r) (fnil inc 0)))
+                                    {:2xx 0 :3xx 0 :4xx 0 :5xx 0 :error 0}
+                                    results)
+                     receipt {:receipt/date day
+                              :receipt/policy "AWAI-3824 decision (b): weekly manual HEAD status check; counts + date only, no bodies"
+                              :receipt/tool "tools/check_citation_status.cljk"
+                              :receipt/tool-revision rev
+                              :receipt/catalog catalog-path
+                              :receipt/catalog-entries n
+                              :receipt/user-agent user-agent
+                              :receipt/totals counts
+                              :receipt/entries
+                              (mapv (fn [r]
+                                      (cond-> {:cite/id (:id r)
+                                               :cite/url (:url r)
+                                               :method (:method r)
+                                               :class (:class r)}
+                                        (some? (:status r)) (assoc :status (:status r))
+                                        (some? (:why r)) (assoc :why (:why r))))
+                                    results)}]
+                 (write-receipt! out-path receipt)
+                 (say "CHECKED" n "OK" (:2xx counts)
+                      "3xx" (:3xx counts) "4xx" (:4xx counts)
+                      "5xx" (:5xx counts) "ERR" (:error counts)
+                      "MIN" declared-min)
+                 (say "RECEIPT" out-path)
+                 (cond
+                   (zero? n)
+                   (do (println "FLOOR zero checks") (finish! 2))
+
+                   (< n declared-min)
+                   (do (println "FLOOR below min-citations" declared-min "got" n)
+                       (finish! 2))
+
+                   (seq bad)
+                   (do (doseq [b bad]
+                         (println "DRIFT" (:id b) (:url b) (:why b)))
+                       (finish! 1))
+
+                   :else
+                   (do (say "PASS") (finish! 0))))))
+            (.catch
+             (fn [err]
+               (println "UNANSWERED" (.-message err))
+               (finish! 2))))))))
+
+(defn run-verify! []
+  ;; A claimed run without its dated receipt is a red gate: fail naming the cause.
+  (if-not (.existsSync fs verify-path)
+    (do (println "MISSING receipt" verify-path "-- no run was recorded there")
+        (finish! 1))
+    (let [raw (try (edn/read-string (.readFileSync fs verify-path "utf8"))
+                   (catch :default e
+                     (println "PARSE-FAIL receipt" verify-path (.-message e))
+                     (finish! 1)
+                     nil))]
+      (when raw
+        (let [entries (:receipt/entries raw)
+              totals (:receipt/totals raw)]
+          (cond
+            (not (seq entries))
+            (do (println "EMPTY receipt entries" verify-path) (finish! 1))
+
+            (not (map? totals))
+            (do (println "NO TOTALS in receipt" verify-path) (finish! 1))
+
+            :else
+            (do (say "VERIFIED" verify-path
+                     "date" (:receipt/date raw)
+                     "entries" (count entries)
+                     "totals" (pr-str totals))
+                (finish! 0))))))))
+
+(if verify-path (run-verify!) (run-check!))
