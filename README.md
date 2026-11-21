@@ -37,6 +37,8 @@ README.edn                  # Machine-readable self-description
 migration.edn               # Provenance: what was extracted, and from where
 facts/catalog.edn           # Cited public sources, with a declared floor
 tools/verify_citations.cljk # Live gate: every citation must return 2xx
+tools/check_citation_status.cljk # Weekly manual status check (AWAI-3824)
+receipts/                   # Dated status receipts, one file per weekly run
 test/run.cljk               # Offline gate: the records parse and agree
 ```
 
@@ -60,6 +62,40 @@ kbb --backend sci tools/verify_citations.cljk               # live: every cited 
 The two are separate because they answer different questions and fail for
 different reasons. The live gate is worth what the network is worth at the
 moment it runs; the offline one settles what the bytes here can settle.
+
+## Citation status (weekly manual gate, AWAI-3824)
+
+Decision (AWAI-3824, owner 2026-11-22): "(b) 手動の検査。CI の例外の
+runner は作らない。" Tatara CI runs with `:network :none`, so the live 2xx
+gate (`tools/verify_citations.cljk`) cannot run there. Leaving it red in CI
+is not an option, and silently skipping it is the failure this policy exists
+to prevent.
+
+- Who runs it: once a week, an Orca automation (Ontology Collector) wakes a
+  Muse worker to run the check and commit the dated receipt in a small
+  one-commit PR.
+- Command: `kbb --backend sci tools/check_citation_status.cljk` (writes
+  `receipts/<UTC-date>.edn`; re-check an old claim with `kbb --backend sci
+  tools/check_citation_status.cljk --verify receipts/<date>.edn`, which fails
+  when the receipt is missing).
+- Method: HEAD only per URL; one Range GET retry (`bytes=0-0`) when HEAD
+  answers 4xx/5xx or fails at the transport level; at least 1000 ms between
+  two requests to the same host; generic User-Agent
+  (`Mozilla/5.0 (compatible; citation-status-check/1.0)`, no personal name,
+  no mail address).
+- Recorded: per-URL status class (2xx / 3xx / 4xx / 5xx / error) plus summary
+  counts and the date. Response bodies, substrings and archives are never
+  stored. Citations are URLs with live status only; no third-party
+  classification text or definitions are republished here.
+- Last checked: 2026-11-21 (`receipts/2026-11-21.edn`: 27 x 2xx, 1 x 4xx).
+- Triage: a non-2xx turns the gate red with the URL and cause named.
+  Re-check the URL, mark it moved, or replace the citation; never delete a
+  failing citation to make the gate green. URLs whose 4xx/5xx is new since
+  the previous week are listed in a comment on AWAI-3824.
+
+New files in this change (`tools/check_citation_status.cljk`, `receipts/`,
+this section) are our own work; their license awaits the rights holder's
+decision. No new LICENSE was added.
 
 ## License
 
