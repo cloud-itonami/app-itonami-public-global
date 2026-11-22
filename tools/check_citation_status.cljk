@@ -12,14 +12,26 @@
 ;;     refuse HEAD (measured 2026-11-21: HEAD 404 / GET 200 on the UN SDG
 ;;     Goals API) while others refuse both (HEAD 403 / Range GET 403 on
 ;;     data.worldbank.org). The retried method is recorded per entry.
+;;   * bot-blocked entries (`:cite/bot-blocked true` in the catalogue) keep
+;;     their canonical :cite/url and additionally list a machine-checkable
+;;     `:cite/check-url` (an api.worldbank.org v2 URL with `?format=json`
+;;     from the same source family). The checker probes BOTH with the same
+;;     HEAD-then-Range-GET method: a 2xx on the check URL counts as verified
+;;     (`:via-check-url true` in the result and receipt); red only when BOTH
+;;     fail, naming both causes. The receipt keeps the bot-blocked count
+;;     separately under `:receipt/bot-blocked`.
+;;   * no circumvention, ever: the same generic User-Agent, no challenge
+;;     solving, no headless browser. A bot wall is recorded, never bypassed.
 ;;   * at least 1000 ms between two requests to the same host
 ;;   * generic User-Agent (no personal name, no mail address)
 ;;   * record per-URL status class + summary counts + date only.
 ;;     Response bodies, substrings and archives are never stored.
 ;;
 ;; Exit codes:
-;;   0 — answered, every citation checked, all 2xx
-;;   1 — answered red: at least one citation non-2xx, or --verify failed
+;;   0 — answered, every citation checked, all 2xx (a bot-blocked entry
+;;       whose check URL answers 2xx counts as verified, not red)
+;;   1 — answered red: at least one citation non-2xx (both URLs failed for a
+;;       bot-blocked entry), or --verify failed
 ;;   2 — could not answer (parse failure, zero checks, floor miss)
 ;;
 ;; "Nothing was checked" and "nothing was wrong" must not share an exit code.
@@ -150,22 +162,67 @@
     (and (>= status 500) (<= status 599)) :5xx
     :else :error))
 
-(defn check-entry! [e]
-  (-> (fetch-status (:cite/url e))
+(defn probe! [u]
+  ;; One URL through the standard method: HEAD, retried once with Range GET
+  ;; (`bytes=0-0`) when HEAD answers 4xx/5xx or fails at the transport
+  ;; level. Resolves {:ok? :url :method :status :class (:why)}.
+  (-> (fetch-status u)
       (.then
        (fn [{:keys [status method]}]
          (let [class (classify status)]
            (if (= class :2xx)
-             {:ok? true :id (:cite/id e) :url (:cite/url e)
+             {:ok? true :url u
               :method method :status status :class class}
-             {:ok? false :id (:cite/id e) :url (:cite/url e)
+             {:ok? false :url u
               :method method :status status :class class
               :why (str "HTTP " status)}))))
       (.catch
        (fn [err]
-         {:ok? false :id (:cite/id e) :url (:cite/url e)
+         {:ok? false :url u
           :method "HEAD,GET+Range" :status nil :class :error
           :why (str "fetch-error " (.-message err))}))))
+
+(defn check-entry! [e]
+  (if-not (:cite/bot-blocked e)
+    (-> (probe! (:cite/url e))
+        (.then (fn [r] (assoc r :id (:cite/id e)))))
+    ;; Bot-blocked: the canonical :cite/url stays, but the machine verdict
+    ;; also consults :cite/check-url. Both are probed with the same method —
+    ;; no special User-Agent, no challenge solving, no headless browser.
+    ;; Verified when the check URL answers 2xx; red only when BOTH fail.
+    (let [id (:cite/id e)
+          check-url (:cite/check-url e)]
+      (if-not (and (string? check-url) (seq check-url))
+        (js/Promise.resolve
+         {:ok? false :id id :url (:cite/url e)
+          :method "HEAD,GET+Range" :status nil :class :error
+          :bot-blocked true :check-url nil
+          :why "bot-blocked entry without :cite/check-url"})
+        (-> (probe! (:cite/url e))
+            (.then
+             (fn [primary]
+               (if (:ok? primary)
+                 (assoc primary :id id
+                        :bot-blocked true :check-url check-url)
+                 (-> (probe! check-url)
+                     (.then
+                      (fn [checked]
+                        (if (:ok? checked)
+                          (-> primary
+                              (assoc :ok? true :id id
+                                     :bot-blocked true :check-url check-url
+                                     :via-check-url true
+                                     :check-method (:method checked)
+                                     :check-status (:status checked))
+                              (dissoc :why))
+                          {:ok? false :id id :url (:cite/url e)
+                           :method (:method primary)
+                           :status (:status primary) :class (:class primary)
+                           :bot-blocked true :check-url check-url
+                           :check-method (:method checked)
+                           :check-status (:status checked)
+                           :why (str (:why primary) "; check-url "
+                                     check-url " " (:why checked))}))))))))))))
 
 (defn utc-date []
   (let [d (js/Date.)]
@@ -224,8 +281,17 @@
                                 (.then (fn [r]
                                          (say (if (:ok? r) "OK" "FAIL")
                                               (:id r)
-                                              (or (:why r) (:status r))
-                                              (str "(" (:method r) ")"))
+                                              (cond
+                                                (:why r) (:why r)
+                                                (:via-check-url r)
+                                                (str "primary HTTP " (:status r)
+                                                     ", verified via check-url HTTP "
+                                                     (:check-status r))
+                                                :else (:status r))
+                                              (str "(" (:method r)
+                                                   (when (:via-check-url r)
+                                                     (str " check:" (:check-method r)))
+                                                   ")"))
                                          (conj acc r))))))))
              (js/Promise.resolve [])
              entries)
@@ -236,6 +302,8 @@
                      counts (reduce (fn [m r] (update m (:class r) (fnil inc 0)))
                                     {:2xx 0 :3xx 0 :4xx 0 :5xx 0 :error 0}
                                     results)
+                     bot-n (count (filter :bot-blocked results))
+                     via-n (count (filter :via-check-url results))
                      receipt {:receipt/date day
                               :receipt/policy "AWAI-3824 decision (b): weekly manual HEAD status check; counts + date only, no bodies"
                               :receipt/tool "tools/check_citation_status.cljk"
@@ -244,6 +312,7 @@
                               :receipt/catalog-entries n
                               :receipt/user-agent user-agent
                               :receipt/totals counts
+                              :receipt/bot-blocked bot-n
                               :receipt/entries
                               (mapv (fn [r]
                                       (cond-> {:cite/id (:id r)
@@ -251,13 +320,19 @@
                                                :method (:method r)
                                                :class (:class r)}
                                         (some? (:status r)) (assoc :status (:status r))
-                                        (some? (:why r)) (assoc :why (:why r))))
+                                        (some? (:why r)) (assoc :why (:why r))
+                                        (some? (:bot-blocked r)) (assoc :bot-blocked (:bot-blocked r))
+                                        (some? (:check-url r)) (assoc :check-url (:check-url r))
+                                        (true? (:via-check-url r)) (assoc :via-check-url true)
+                                        (some? (:check-method r)) (assoc :check-method (:check-method r))
+                                        (some? (:check-status r)) (assoc :check-status (:check-status r))))
                                     results)}]
                  (write-receipt! out-path receipt)
                  (say "CHECKED" n "OK" (:2xx counts)
                       "3xx" (:3xx counts) "4xx" (:4xx counts)
                       "5xx" (:5xx counts) "ERR" (:error counts)
                       "MIN" declared-min)
+                 (say "BOT-BLOCKED" bot-n "verified-via-check" via-n)
                  (say "RECEIPT" out-path)
                  (cond
                    (zero? n)
