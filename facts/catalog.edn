@@ -8,6 +8,12 @@
 ;;
 ;; Gate: `kbb --backend sci tools/verify_citations.cljk` must exit 0. Do not add a URL that
 ;; does not return 2xx under that gate.
+;;
+;; Bot-blocked exception (AWAI-3824 follow-up): an entry with
+;; `:cite/bot-blocked true` keeps its canonical :cite/url and is machine-checked
+;; via :cite/check-url by `tools/check_citation_status.cljk` (see README).
+;; `tools/verify_citations.cljk` probes canonical URLs only and has no
+;; bot-blocked handling; changing it is out of scope here.
 
 {:catalog/id "public-global/resource-flow-sources/v1"
  :catalog/about
@@ -52,7 +58,9 @@
    :cite/url "https://data.worldbank.org/"
    :cite/kind :publisher-home
    :cite/expect-substring "World Bank"
-   :cite/note "World Bank Open Data portal."}
+   :cite/note "World Bank Open Data portal. Bot-blocked: Cloudflare challenge answers 403 to HEAD and Range GET (human-verified alive 2026-11-22); the machine check runs against :cite/check-url."
+   :cite/bot-blocked true
+   :cite/check-url "https://api.worldbank.org/v2/country?format=json&per_page=1"}
 
   {:cite/id :worldbank/climate-data
    :cite/url "https://climatedata.worldbank.org/"

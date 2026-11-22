@@ -87,7 +87,23 @@ to prevent.
   counts and the date. Response bodies, substrings and archives are never
   stored. Citations are URLs with live status only; no third-party
   classification text or definitions are republished here.
-- Last checked: 2026-11-21 (`receipts/2026-11-21.edn`: 27 x 2xx, 1 x 4xx).
+- Last checked: 2026-11-22 (`receipts/2026-11-22.edn`: 27 x 2xx
+  direct, 1 x 4xx primary verified via its check URL, 1 bot-blocked).
+- Bot-blocked (AWAI-3824 follow-up, owner decision (b)): a cited URL that
+  answers 403 to both HEAD and Range GET because of a bot wall — not a move
+  and not dead — keeps its canonical `:cite/url` and carries the mark
+  `:cite/bot-blocked true` plus a machine-checkable `:cite/check-url`
+  (an `api.worldbank.org/v2/...?format=json` URL from the same source
+  family). The checker probes both with the same method; a 2xx on the
+  check URL counts as verified (`:via-check-url true`, primary status kept
+  in the receipt). Red only when both fail, naming both causes. The
+  receipt keeps the bot-blocked count separately (`:receipt/bot-blocked`).
+  Current: `:worldbank/data-portal` (`https://data.worldbank.org/`,
+  Cloudflare challenge, human-verified alive 2026-11-22) is checked via
+  `https://api.worldbank.org/v2/country?format=json&per_page=1`.
+- No circumvention, ever: the generic User-Agent above is the only
+  identity sent; challenge pages are never solved and no headless browser
+  is used. A bot wall is recorded (`:cite/bot-blocked`), never bypassed.
 - Triage: a non-2xx turns the gate red with the URL and cause named.
   Re-check the URL, mark it moved, or replace the citation; never delete a
   failing citation to make the gate green. URLs whose 4xx/5xx is new since
