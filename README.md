@@ -87,7 +87,7 @@ to prevent.
   counts and the date. Response bodies, substrings and archives are never
   stored. Citations are URLs with live status only; no third-party
   classification text or definitions are republished here.
-- Last checked: 2026-11-22 (`receipts/2026-11-22.edn`: 27 x 2xx
+- Last checked: 2026-11-23 (`receipts/2026-11-23.edn`: 27 x 2xx
   direct, 1 x 4xx primary verified via its check URL, 1 bot-blocked).
 - Bot-blocked (AWAI-3824 follow-up, owner decision (b)): a cited URL that
   answers 403 to both HEAD and Range GET because of a bot wall — not a move
